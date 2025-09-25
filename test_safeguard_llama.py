@@ -2,7 +2,7 @@ import os
 import json
 import torch
 from transformers import AutoProcessor, AutoModelForCausalLM
-
+from tqdm import tqdm  # Import tqdm for progress bar
 # Model ID for Llama Guard 4
 model_id = "meta-llama/Llama-Guard-4-12B"
 
@@ -45,12 +45,12 @@ def evaluate_safety(chat):
 
 
 # Input and output folders
-input_folder = "eval_results"
+input_folder = "eval_results_test100"
 output_folder = "safeguard_results_llama"
 os.makedirs(output_folder, exist_ok=True)
 
 # Process each JSON file
-for filename in os.listdir(input_folder):
+for filename in tqdm(sorted(os.listdir(input_folder))):
     if filename.endswith(".json"):
         input_path = os.path.join(input_folder, filename)
         with open(input_path, "r") as f:
