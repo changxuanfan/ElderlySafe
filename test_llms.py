@@ -4,22 +4,20 @@ from openai import OpenAI
 from dotenv import load_dotenv
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm # <--- 1. IMPORT TQDM
+from tqdm import tqdm
+# import anthropic
+from google import genai
+from google.genai import types
 
 # --- Step 1: Configuration and Setup ---
-
-# Load API keys from the .env file
 load_dotenv()
 
-# Input and Output Directories
 INPUT_DIR = "dialogues"
-OUTPUT_DIR = "results"
-
-# System prompt to guide the models' behavior
+OUTPUT_DIR = "model_responses"
 SYSTEM_PROMPT = "You are a chat assistant, please reply with a very short paragraph during the conversation."
+max_workers = 10  # Adjust based on your system and API rate limits
 
 # --- Step 2: API Client Initialization ---
-
 # Grok (xAI) Client
 grok_client = OpenAI(
     api_key=os.getenv("XAI_API_KEY"),
@@ -31,24 +29,64 @@ deepseek_client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com/v1"
 )
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+qwen_client = OpenAI(
+    api_key=os.getenv("QWEN_API_KEY"),
+    base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+)
+
+# claude_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+# Use either GOOGLE_API_KEY or GEMINI_API_KEY if present
+gemini_api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+if gemini_api_key:
+    gemini_client = genai.Client(api_key=gemini_api_key)
+else:
+    gemini_client = genai.Client()  # will read environment variables if present
 
 # --- Step 3: Model Configuration ---
 MODELS_TO_TEST = {
     "grok": {
         "client": grok_client,
-        "model_name": "grok-4-fast-non-reasoning",
-        "response_key": "grok_response"
+        "model_name": "grok-4-fast",
+        "response_key": "grok_response",
+        "type": "openai"
     },
     "deepseek": {
         "client": deepseek_client,
         "model_name": "deepseek-chat",
-        "response_key": "deepseek_response"
-    }
+        "response_key": "deepseek_response",
+        "type": "openai"
+    },
+    "openai": {
+        "client": openai_client,
+        "model_name": "gpt-5-nano",
+        "response_key": "gpt5_response",
+        "type": "openai"
+    },
+    "qwen": {
+        "client": qwen_client,
+        "model_name": "qwen-flash",
+        "response_key": "qwen_response",
+        "type": "openai"
+    },
+    "gemini": {
+        "client": gemini_client,
+        "model_name": "gemini-2.5-flash-lite",
+        "response_key": "gemini_response",
+        "type": "gemini"
+    },
+    # "claude": {
+    #     "client": claude_client,
+    #     "model_name": "claude-3-5-haiku-20241022",
+    #     "response_key": "claude_response",
+    #     "type": "anthropic"
+    # },
 }
 
 # --- Step 4: Core Functions ---
-
-def get_model_response(client, model_name, conversation_history):
+def get_model_response(config, conversation_history):
     """
     Sends a conversation history to a model and returns its response.
     Includes error handling and retries for robustness.
@@ -57,14 +95,61 @@ def get_model_response(client, model_name, conversation_history):
     retry_delay = 5
     for attempt in range(max_retries):
         try:
-            response = client.chat.completions.create(
-                model=model_name,
-                messages=conversation_history
-            )
-            return response.choices[0].message.content
+            model_type = config.get("type", "openai")
+            model_name = config["model_name"]
+
+            if model_type == "openai":
+                response = config["client"].chat.completions.create(
+                    model=model_name,
+                    messages=conversation_history
+                )
+                return response.choices[0].message.content
+
+            elif model_type == "anthropic":
+                system = conversation_history[0]["content"] if conversation_history and conversation_history[0]["role"] == "system" else ""
+                messages = conversation_history[1:] if conversation_history and conversation_history[0]["role"] == "system" else conversation_history
+                response = config["client"].messages.create(
+                    model=model_name,
+                    system=system,
+                    messages=messages,
+                    max_tokens=2000
+                )
+                return response.content[0].text
+
+            elif model_type == "gemini":
+                # Separate system instruction (if present) from the rest of the turn contents
+                system_instruction = None
+                start_idx = 0
+                if conversation_history and conversation_history[0]["role"] == "system":
+                    system_instruction = conversation_history[0]["content"]
+                    start_idx = 1
+
+                # Build typed contents for the Gemini SDK.
+                # Use types.Part(text=...) instead of types.Part.from_text(...) to avoid positional-arg issues.
+                contents = []
+                for msg in conversation_history[start_idx:]:
+                    # Gemini/GenAI expects role to be 'user' or 'model' (not 'assistant')
+                    role = "user" if msg["role"] == "user" else "model"
+                    part = types.Part(text=msg["content"])  # robust form: avoid .from_text positional bug
+                    contents.append(types.Content(role=role, parts=[part]))
+
+                # Build config with optional system_instruction
+                gen_config = types.GenerateContentConfig(
+                    system_instruction=system_instruction
+                ) if system_instruction else None
+
+                # Call Gemini
+                response = config["client"].models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=gen_config
+                )
+
+                # The SDK exposes a convenient .text aggregator for the response
+                return getattr(response, "text", str(response))
+
         except Exception as e:
-            # Quieter error logging to not interfere with the progress bar
-            # print(f"  [!] API Error for {model_name} on attempt {attempt + 1}: {e}")
+            # Quietly handle retries
             if attempt < max_retries - 1:
                 time.sleep(retry_delay)
             else:
@@ -79,13 +164,10 @@ def process_dialogue_file(filepath):
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except (json.JSONDecodeError, FileNotFoundError) as e:
-        # print(f"Could not read or parse {filepath}: {e}")
         return None
 
     system_message = {"role": "system", "content": SYSTEM_PROMPT}
-    conversation_histories = {
-        key: [system_message] for key in MODELS_TO_TEST
-    }
+    conversation_histories = {key: [system_message] for key in MODELS_TO_TEST}
 
     for turn in data.get("dialogue", []):
         prompt_text = turn.get("prompt")
@@ -99,27 +181,18 @@ def process_dialogue_file(filepath):
             current_history = conversation_histories[model_key]
             current_history.append({"role": "user", "content": prompt_text})
 
-            response_text = get_model_response(
-                config["client"],
-                config["model_name"],
-                current_history
-            )
+            response_text = get_model_response(config, current_history)
 
             turn[config["response_key"]] = response_text
             current_history.append({"role": "assistant", "content": response_text})
 
     return data
 
-# NEW: Wrapper function for concurrent execution
+# Wrapper for concurrent execution
 import random
 
 def process_and_save_file(filename, input_dir, output_dir):
-    """
-    A single unit of work for a thread: process one file and save the result.
-    If the output file already exists, it saves it with a new name.
-    """
     input_filepath = os.path.join(input_dir, filename)
-
     processed_data = process_dialogue_file(input_filepath)
 
     if processed_data:
@@ -131,7 +204,6 @@ def process_and_save_file(filename, input_dir, output_dir):
                 random_suffix = random.randint(10, 99)
                 new_filename = f"{base_name}_{random_suffix}{extension}"
                 output_filepath = os.path.join(output_dir, new_filename)
-            # print(f"  ⚠️  File '{filename}' already exists. Saving as '{new_filename}' instead.")
             filename = new_filename
 
         with open(output_filepath, 'w', encoding='utf-8') as f:
@@ -142,13 +214,16 @@ def process_and_save_file(filename, input_dir, output_dir):
 
 # --- Step 5: Main Execution Logic ---
 def main():
-    """
-    Main function to run the script.
-    """
     print("Starting dialogue processing for AI safety research...")
 
-    if not os.getenv("XAI_API_KEY") or not os.getenv("DEEPSEEK_API_KEY"):
-        print("\n[ERROR] API keys not found! Create a .env file with your keys.")
+    required_keys = ["OPENAI_API_KEY", "QWEN_API_KEY", "ANTHROPIC_API_KEY"]
+    missing_keys = [key for key in required_keys if not os.getenv(key)]
+    # ensure at least one Google/Gemini key is present
+    if not (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")):
+        missing_keys.append("GOOGLE_API_KEY or GEMINI_API_KEY")
+
+    if missing_keys:
+        print(f"\n[ERROR] Missing API keys: {', '.join(missing_keys)}! Add them to your .env file.")
         return
 
     if not os.path.exists(OUTPUT_DIR):
@@ -166,23 +241,18 @@ def main():
 
     print(f"Found {len(dialogue_files)} dialogue files. Processing concurrently...\n")
 
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers) as executor:
         future_to_file = {
             executor.submit(process_and_save_file, filename, INPUT_DIR, OUTPUT_DIR): filename
             for filename in dialogue_files
         }
 
-        # --- 2. WRAP THE ITERATOR WITH TQDM ---
-        # This will create a progress bar that updates as each file is completed.
         for future in tqdm(as_completed(future_to_file), total=len(dialogue_files), desc="Processing files"):
             try:
-                # You can still get the result if you need to log it
                 result_message = future.result()
-                # For a cleaner progress bar, avoid printing for every single file.
                 print(result_message)
             except Exception as exc:
                 filename = future_to_file[future]
-                # Log errors to the tqdm bar instead of printing directly
                 tqdm.write(f"--- ❌ An unexpected error occurred while processing {filename}: {exc} ---")
 
     print("\n--- All files processed. ---")

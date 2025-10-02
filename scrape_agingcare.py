@@ -1,134 +1,161 @@
+import requests
+from bs4 import BeautifulSoup
 import json
 import time
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
-from bs4 import BeautifulSoup
-import requests  # For any static fallback, but mainly Selenium here
+import os
+import re
 
 # Configuration
-DELAY = 2  # Seconds between requests
-OUTPUT_FILE = 'agingcare_discussions.json'
-MAIN_URL = 'https://www.agingcare.com/topics'
-LETTERS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z']
+BASE_URL = "https://www.agingcare.com"
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+}
+DELAY_BETWEEN_QUESTIONS = 0.5  # seconds
+DELAY_BETWEEN_PAGES = 2    # seconds
+MAX_QUESTIONS_PER_TOPIC = 20
+OUTPUT_DIR = 'AgingCare_Posts'
+TOPIC_LINKS_FILE = 'agingcare_topic_links.json'
 
-# Initialize driver (assumes ChromeDriver in PATH)
-options = webdriver.ChromeOptions()
-options.add_argument('--headless')  # Run without GUI; remove for debugging
-driver = webdriver.Chrome(options=options)
-wait = WebDriverWait(driver, 10)
+def get_max_pages(session, topic_url):
+    """Fetch the first page of a topic and determine the total number of pages."""
+    try:
+        response = session.get(BASE_URL + topic_url, headers=HEADERS)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        max_page = 1
+        pag_links = soup.find_all('a', href=re.compile(r'page=\d+'))
+        for link in pag_links:
+            match = re.search(r'page=(\d+)', link.get('href', ''))
+            if match:
+                max_page = max(max_page, int(match.group(1)))
+        
+        return max_page
+    except Exception as e:
+        print(f"Error detecting max pages for {topic_url}: {e}")
+        return 1
 
-discussions = []
+def extract_question_links(soup, remaining_needed):
+    """Extract up to `remaining_needed` question titles and URLs from a list page."""
+    questions = []
+    ul = soup.find('ul', class_='unstyled', attrs={'data-page': 'true'})
+    if not ul:
+        print("Warning: Could not find question list <ul>.")
+        return questions
+    
+    for li in ul.find_all('li', class_='item'):
+        if len(questions) >= remaining_needed:
+            break
+        a_tag = li.find('a', class_='blue-link')
+        if a_tag and a_tag.find('h3'):
+            title = a_tag.find('h3').get_text(strip=True)
+            if title:
+                url = BASE_URL + a_tag['href']
+                questions.append({'title': title, 'url': url})
+    return questions
 
-def extract_plain_text(html_content):
-    """Extract plain text from HTML, stripping tags and normalizing."""
-    soup = BeautifulSoup(html_content, 'html.parser')
-    # Remove script/style, get text, clean up
-    for script in soup(["script", "style", "nav", "footer"]):
-        script.decompose()
-    text = soup.get_text()
-    lines = (line.strip() for line in text.splitlines())
-    chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-    text = ' '.join(chunk for chunk in chunks if chunk)
-    return text
+def extract_question_content(session, url, title):
+    """Fetch a question page and extract the original post body."""
+    try:
+        response = session.get(url, headers=HEADERS)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        section = soup.find('section', class_='Content Question-Content')
+        if not section:
+            print(f"Warning: Could not find <section class='Content Question-Content'> for '{title[:50]}...'")
+            return ""
+        
+        content_div = section.find('div', class_='text bodyNeutral black pad-btm-l', attrs={'itemprop': 'text'})
+        if not content_div:
+            print(f"Warning: Could not find content <div> for '{title[:50]}...'")
+            return ""
+        
+        paragraphs = content_div.find_all('p')
+        content_parts = [p.get_text(strip=True) for p in paragraphs if p.get_text(strip=True)]
+        content = ' '.join(content_parts) if content_parts else ""
+        
+        if not content:
+            print(f"Warning: No content extracted for '{title[:50]}...'")
+        
+        return content
+    except Exception as e:
+        print(f"Error fetching/extracting {url}: {e}")
+        return ""
 
-try:
-    driver.get(MAIN_URL)
-    time.sleep(DELAY)
+def sanitize_filename(name):
+    """Convert topic name to a valid filename."""
+    # Remove invalid characters and replace spaces with underscores
+    return re.sub(r'[^\w\s-]', '', name.replace(' Questions', '')).strip().replace(' ', '_') + '.json'
 
-    # Navigate A-Z letters (assuming links are <a> with href containing 'letter=' or similar; adjust if needed)
-    for letter in LETTERS:
+def scrape_topic(session, topic_name, topic_url):
+    """Scrape up to MAX_QUESTIONS_PER_TOPIC questions for a single topic."""
+    stories = []
+    page_num = 1
+    max_pages = get_max_pages(session, topic_url)
+    print(f"Scraping topic '{topic_name}' ({max_pages} pages)...")
+    
+    while len(stories) < MAX_QUESTIONS_PER_TOPIC and page_num <= max_pages:
+        page_url = f"{BASE_URL}{topic_url}?page={page_num}" if page_num > 1 else f"{BASE_URL}{topic_url}"
+        print(f"  Page {page_num}/{max_pages}...")
+        
         try:
-            # Find and click letter link (inspect site: likely class='letter-link' or href=f'javascript:loadLetter("{letter}")')
-            # Fallback: construct URL if direct, e.g., MAIN_URL + f'?letter={letter.lower()}'
-            letter_url = f'{MAIN_URL}?letter={letter.lower()}'
-            driver.get(letter_url)
-            time.sleep(DELAY)
-
-            # Extract topic links on letter page (e.g., <a class="topic-link" href="/topics/ID/name">)
-            topic_links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/topics/"]')  # Adjust selector as needed
-            for link in topic_links:
-                topic_href = link.get_attribute('href')
-                if '/topics/' in topic_href and topic_href not in [t['url'] for t in discussions]:  # Avoid dups
-                    topic_name = link.text.strip() or topic_href.split('/')[-1].replace('-', ' ').title()
-                    print(f"Processing topic: {topic_name}")
-
-                    # Go to topic page
-                    driver.get(topic_href)
-                    time.sleep(DELAY)
-
-                    # Click "Discussions" tab/section (e.g., <a href="#discussions"> or class="tab-discussions")
-                    try:
-                        discussions_tab = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, '[data-tab="discussions"], a[href*="discussions"], .discussions-link')))
-                        discussions_tab.click()
-                        time.sleep(DELAY)
-                    except TimeoutException:
-                        print(f"No discussions tab found for {topic_name}; skipping.")
-                        continue
-
-                    # Extract discussion list (paginated)
-                    page_num = 1
-                    while True:
-                        # Find discussion items (e.g., <div class="discussion-item"> with <a> title and href)
-                        disc_elements = driver.find_elements(By.CSS_SELECTOR, '.discussion-item, .forum-thread, a[href*="/questions/"], a[href*="/discussions/"]')
-                        new_discs = False
-                        for elem in disc_elements:
-                            try:
-                                disc_title_elem = elem.find_element(By.CSS_SELECTOR, 'a, h3, .title')
-                                disc_title = disc_title_elem.text.strip()
-                                disc_url = disc_title_elem.get_attribute('href')
-                                if not disc_url or disc_title in [d['title'] for d in discussions]:
-                                    continue
-                                new_discs = True
-
-                                # Go to discussion thread
-                                driver.get(disc_url)
-                                time.sleep(DELAY)
-
-                                # Extract title and full content
-                                thread_title = driver.find_element(By.CSS_SELECTOR, 'h1, .thread-title').text.strip()
-                                thread_html = driver.find_element(By.CSS_SELECTOR, '.post-content, .thread-body, main').get_attribute('innerHTML')
-                                plain_text = extract_plain_text(thread_html)
-
-                                discussions.append({
-                                    "topic": topic_name,
-                                    "title": thread_title,
-                                    "plain_text": plain_text
-                                })
-                                print(f"Scraped discussion: {thread_title[:50]}...")
-
-                                # Back to discussions list
-                                driver.get(topic_href)
-                                discussions_tab.click()
-                                time.sleep(DELAY)
-                            except NoSuchElementException:
-                                continue
-
-                        if not new_discs:
-                            break
-
-                        # Check for next page (e.g., <a class="next">)
-                        try:
-                            next_btn = driver.find_element(By.CSS_SELECTOR, '.next-page, a[rel="next"]')
-                            if 'disabled' in next_btn.get_attribute('class') or not next_btn.is_enabled():
-                                break
-                            next_btn.click()
-                            time.sleep(DELAY)
-                            page_num += 1
-                        except NoSuchElementException:
-                            break
-
+            response = session.get(page_url, headers=HEADERS)
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            remaining_needed = MAX_QUESTIONS_PER_TOPIC - len(stories)
+            page_questions = extract_question_links(soup, remaining_needed)
+            print(f"  Found {len(page_questions)} questions on page {page_num}")
+            
+            if not page_questions:
+                print("  No more questions found. Stopping this topic.")
+                break
+            
+            for q in page_questions:
+                content = extract_question_content(session, q['url'], q['title'])
+                stories.append({
+                    'title': q['title'],
+                    'story': content.strip()
+                })
+                print(f"  Scraped: {q['title'][:50]}... ({len(content)} chars)")
+                time.sleep(DELAY_BETWEEN_QUESTIONS)
+                
+                if len(stories) >= MAX_QUESTIONS_PER_TOPIC:
+                    break
+            
+            page_num += 1
+            time.sleep(DELAY_BETWEEN_PAGES)
         except Exception as e:
-            print(f"Error processing letter {letter}: {e}")
-            continue
+            print(f"  Error scraping page {page_num} for {topic_name}: {e}")
+            break
+    
+    return stories
 
-finally:
-    driver.quit()
+def main():
+    # Create output directory
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    # Read topic links
+    try:
+        with open(TOPIC_LINKS_FILE, 'r', encoding='utf-8') as f:
+            topic_links = json.load(f)
+    except Exception as e:
+        print(f"Error reading {TOPIC_LINKS_FILE}: {e}")
+        return
+    
+    session = requests.Session()
+    
+    for topic in topic_links:
+        topic_name = topic['topic']
+        topic_url = topic['link'].replace(BASE_URL, '')  # Get relative URL
+        stories = scrape_topic(session, topic_name, topic_url)
+        
+        # Save to individual JSON file
+        output_file = os.path.join(OUTPUT_DIR, sanitize_filename(topic_name))
+        with open(output_file, 'w', encoding='utf-8') as f:
+            json.dump({'stories': stories}, f, indent=4, ensure_ascii=False)
+        print(f"Saved {len(stories)} stories to {output_file}\n")
 
-# Save to JSON
-with open(OUTPUT_FILE, 'w', encoding='utf-8') as f:
-    json.dump(discussions, f, ensure_ascii=False, indent=2)
-
-print(f"Scraping complete! {len(discussions)} discussions saved to {OUTPUT_FILE}.")
+if __name__ == "__main__":
+    main()
